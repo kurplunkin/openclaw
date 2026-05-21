@@ -1,0 +1,139 @@
+name: Personal Telegram QA
+
+on:
+  workflow_dispatch:
+    inputs:
+      provider_mode:
+        description: QA provider mode
+        required: true
+        default: mock-openai
+        type: choice
+        options:
+          - mock-openai
+          - live-frontier
+      scenario:
+        description: Optional comma-separated Telegram scenario ids
+        required: false
+        default: ""
+        type: string
+      capture_content:
+        description: Keep Telegram message bodies in observed-message artifacts
+        required: true
+        default: "false"
+        type: choice
+        options:
+          - "false"
+          - "true"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: personal-telegram-qa
+  cancel-in-progress: false
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+  NODE_VERSION: "24.x"
+  PNPM_VERSION: "11.0.8"
+  OPENCLAW_BUILD_PRIVATE_QA: "1"
+  OPENCLAW_ENABLE_PRIVATE_QA_CLI: "1"
+  OPENCLAW_QA_TELEGRAM_GROUP_ID: ${{ secrets.OPENCLAW_QA_TELEGRAM_GROUP_ID }}
+  OPENCLAW_QA_TELEGRAM_DRIVER_BOT_TOKEN: ${{ secrets.OPENCLAW_QA_TELEGRAM_DRIVER_BOT_TOKEN }}
+  OPENCLAW_QA_TELEGRAM_SUT_BOT_TOKEN: ${{ secrets.OPENCLAW_QA_TELEGRAM_SUT_BOT_TOKEN }}
+  OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+
+jobs:
+  telegram-qa:
+    name: Run official Telegram QA
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Setup Node environment
+        uses: ./.github/actions/setup-node-env
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          pnpm-version: ${{ env.PNPM_VERSION }}
+          install-bun: "true"
+
+      - name: Validate secrets
+        shell: bash
+        run: |
+          set -euo pipefail
+          require_var() {
+            local key="$1"
+            if [[ -z "${!key:-}" ]]; then
+              echo "Missing required ${key}." >&2
+              exit 1
+            fi
+          }
+
+          require_var OPENCLAW_QA_TELEGRAM_GROUP_ID
+          require_var OPENCLAW_QA_TELEGRAM_DRIVER_BOT_TOKEN
+          require_var OPENCLAW_QA_TELEGRAM_SUT_BOT_TOKEN
+          if [[ "${{ inputs.provider_mode }}" == "live-frontier" ]]; then
+            require_var OPENAI_API_KEY
+          fi
+
+      - name: Build OpenClaw
+        run: pnpm build
+
+      - name: Run Telegram QA
+        shell: bash
+        env:
+          OPENCLAW_QA_TELEGRAM_CAPTURE_CONTENT: ${{ inputs.capture_content == 'true' && '1' || '0' }}
+          OPENCLAW_QA_REDACT_PUBLIC_METADATA: "1"
+          OPENCLAW_QA_TELEGRAM_CANARY_TIMEOUT_MS: "180000"
+          OPENCLAW_QA_TELEGRAM_SCENARIO_TIMEOUT_MS: "180000"
+        run: |
+          set -euo pipefail
+
+          output_dir=".artifacts/qa-e2e/telegram-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          args=(
+            openclaw
+            qa
+            telegram
+            --credential-source
+            env
+            --provider-mode
+            "${{ inputs.provider_mode }}"
+            --output-dir
+            "${output_dir}"
+          )
+
+          IFS=',' read -ra scenarios <<< "${{ inputs.scenario }}"
+          for scenario in "${scenarios[@]}"; do
+            scenario="$(echo "${scenario}" | xargs)"
+            if [[ -n "${scenario}" ]]; then
+              args+=(--scenario "${scenario}")
+            fi
+          done
+
+          pnpm "${args[@]}"
+
+      - name: Append report to job summary
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          report="$(find .artifacts/qa-e2e -name telegram-qa-report.md -print -quit 2>/dev/null || true)"
+          if [[ -n "${report}" && -f "${report}" ]]; then
+            {
+              echo "## Telegram QA"
+              echo
+              cat "${report}"
+            } >> "${GITHUB_STEP_SUMMARY}"
+          fi
+
+      - name: Upload Telegram QA artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: telegram-qa-${{ github.run_id }}-${{ github.run_attempt }}
+          path: .artifacts/qa-e2e/
+          retention-days: 14
+          if-no-files-found: warn
